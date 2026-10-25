@@ -97,11 +97,15 @@ type Context struct {
 	allowMissingDependencies bool
 
 	// set during PrepareBuildActions
-	pkgNames        map[*packageContext]string
-	liveGlobals     *liveTracker
-	globalVariables map[Variable]ninjaString
-	globalPools     map[Pool]*poolDef
-	globalRules     map[Rule]*ruleDef
+	pkgNames map[*packageContext]string
+
+	// package names for compact actions, see compact_actions.go
+	compactPkgNamesOnce sync.Once
+	compactPkgNames     map[*packageContext]string
+	liveGlobals         *liveTracker
+	globalVariables     map[Variable]ninjaString
+	globalPools         map[Pool]*poolDef
+	globalRules         map[Rule]*ruleDef
 
 	// set during PrepareBuildActions
 	outDir             ninjaString // The builddir special Ninja variable
@@ -298,6 +302,9 @@ type moduleInfo struct {
 	// set during PrepareBuildActions
 	actionDefs localBuildActions
 
+	// set during PrepareBuildActions when compact actions are enabled
+	compactActions *compactActions
+
 	providers []interface{}
 
 	startedMutator  *mutatorInfo
@@ -417,7 +424,7 @@ func newContext() *Context {
 		globs:              make(map[globKey]pathtools.GlobResult),
 		fs:                 pathtools.OsFs,
 		finishedMutators:   make(map[*mutatorInfo]bool),
-		includeTags: &IncludeTags{},
+		includeTags:        &IncludeTags{},
 		outDir:             nil,
 		requiredNinjaMajor: 1,
 		requiredNinjaMinor: 7,
@@ -760,7 +767,6 @@ func shouldVisitFile(c *Context, file *parser.File) (bool, []error) {
 	}
 	return true, []error{}
 }
-
 
 func (c *Context) ParseFileList(rootDir string, filePaths []string,
 	config interface{}) (deps []string, errs []error) {
@@ -1488,6 +1494,10 @@ func newModule(factory ModuleFactory) *moduleInfo {
 func processModuleDef(moduleDef *parser.Module,
 	relBlueprintsFile string, moduleFactories, scopedModuleFactories map[string]ModuleFactory, ignoreUnknownModuleTypes bool) (*moduleInfo, []error) {
 
+	if skippedModuleTypes[moduleDef.Type] {
+		return nil, nil
+	}
+
 	factory, ok := moduleFactories[moduleDef.Type]
 	if !ok && scopedModuleFactories != nil {
 		factory, ok = scopedModuleFactories[moduleDef.Type]
@@ -1603,6 +1613,7 @@ func (c *Context) resolveDependencies(ctx context.Context, config interface{}) (
 		if !c.skipCloneModulesAfterMutators {
 			c.cloneModules()
 		}
+		c.writeVariantStats()
 
 		c.dependenciesReady = true
 	})
@@ -2488,6 +2499,10 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 		}
 
 		pkgNames, depsPackages := c.makeUniquePackageNames(c.liveGlobals)
+		if compactActionsEnabled {
+			// Module actions were rendered with these names already.
+			pkgNames = c.compactPackageNames()
+		}
 
 		deps = append(deps, depsPackages...)
 
@@ -2960,6 +2975,13 @@ func (c *Context) generateModuleBuildActions(config interface{},
 			if len(newErrs) > 0 {
 				errsCh <- newErrs
 				return true
+			}
+			noteGeneratedModule()
+			if compactActionsEnabled {
+				if err := c.compactModuleActions(module); err != nil {
+					errsCh <- []error{err}
+					return true
+				}
 			}
 			return false
 		})
@@ -4043,7 +4065,8 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter) error {
 	buf := bytes.NewBuffer(nil)
 
 	for _, module := range modules {
-		if len(module.actionDefs.variables)+len(module.actionDefs.rules)+len(module.actionDefs.buildDefs) == 0 {
+		if len(module.actionDefs.variables)+len(module.actionDefs.rules)+len(module.actionDefs.buildDefs) == 0 &&
+			module.compactActions == nil {
 			continue
 		}
 
@@ -4081,7 +4104,11 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter) error {
 			return err
 		}
 
-		err = c.writeLocalBuildActions(nw, &module.actionDefs)
+		if module.compactActions != nil {
+			err = writeCompactActions(nw, module.compactActions)
+		} else {
+			err = c.writeLocalBuildActions(nw, &module.actionDefs, c.pkgNames)
+		}
 		if err != nil {
 			return err
 		}
@@ -4135,7 +4162,7 @@ func (c *Context) writeAllSingletonActions(nw *ninjaWriter) error {
 			return err
 		}
 
-		err = c.writeLocalBuildActions(nw, &info.actionDefs)
+		err = c.writeLocalBuildActions(nw, &info.actionDefs, c.pkgNames)
 		if err != nil {
 			return err
 		}
@@ -4158,7 +4185,7 @@ func (c *Context) EndEvent(name string) {
 }
 
 func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
-	defs *localBuildActions) error {
+	defs *localBuildActions, pkgNames map[*packageContext]string) error {
 
 	// Write the local variable assignments.
 	for _, v := range defs.variables {
@@ -4169,7 +4196,7 @@ func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
 		if err != nil {
 			panic(err)
 		}
-		err = nw.Assign(name, value.Value(c.pkgNames))
+		err = nw.Assign(name, value.Value(pkgNames))
 		if err != nil {
 			return err
 		}
@@ -4192,7 +4219,7 @@ func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
 			panic(err)
 		}
 
-		err = def.WriteTo(nw, name, c.pkgNames)
+		err = def.WriteTo(nw, name, pkgNames)
 		if err != nil {
 			return err
 		}
@@ -4205,7 +4232,7 @@ func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
 
 	// Write the build definitions.
 	for _, buildDef := range defs.buildDefs {
-		err := buildDef.WriteTo(nw, c.pkgNames)
+		err := buildDef.WriteTo(nw, pkgNames)
 		if err != nil {
 			return err
 		}

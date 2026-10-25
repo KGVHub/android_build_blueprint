@@ -38,6 +38,7 @@ bootstrap_go_package {
     ],
     pkgPath: "github.com/google/blueprint",
     srcs: [
+        "compact_actions.go",
         "context.go",
         "glob.go",
         "live_tracker.go",

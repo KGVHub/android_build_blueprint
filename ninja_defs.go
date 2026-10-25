@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // A Deps value indicates the dependency file format that Ninja should expect to
@@ -375,7 +376,7 @@ func parseBuildParams(scope scope, params *BuildParams) (*buildDef,
 				return nil, fmt.Errorf("argument lookup error: %s", err)
 			}
 
-			ninjaValue, err := parseNinjaString(scope, value)
+			ninjaValue, err := parseArgNinjaString(scope, value)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing variable %q: %s", name,
 					err)
@@ -459,4 +460,33 @@ func writeVariables(nw *ninjaWriter, variables map[string]ninjaString,
 		}
 	}
 	return nil
+}
+
+// argCacheKey identifies a parsed build argument. ninjaStrings are immutable
+// once parsed and depend only on the scope and the text.
+type argCacheKey struct {
+	scope scope
+	value string
+}
+
+// argCache shares parsed build arguments. Compile actions repeat the same
+// multi-kilobyte flag strings for every source file of a module; parsing each
+// of them once per scope instead of once per build statement keeps a single
+// copy in memory.
+var argCache sync.Map
+
+func parseArgNinjaString(scope scope, value string) (ninjaString, error) {
+	if len(value) < 128 || !strings.Contains(value, "$") {
+		return parseNinjaString(scope, value)
+	}
+	key := argCacheKey{scope, value}
+	if cached, ok := argCache.Load(key); ok {
+		return cached.(ninjaString), nil
+	}
+	parsed, err := parseNinjaString(scope, value)
+	if err != nil {
+		return nil, err
+	}
+	cached, _ := argCache.LoadOrStore(key, parsed)
+	return cached.(ninjaString), nil
 }
